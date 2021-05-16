@@ -4,7 +4,7 @@ end # module
 using Flux
 using Zygote
 using Random
-using Statistics
+using StatsBase
 Random.seed!(1234)
 
 # Define cell parameters
@@ -116,7 +116,7 @@ end
 
 lr = 0.01
 batch_size = 100
-opt = Flux.Optimise.Descent(lr)
+opt = Flux.Optimise.Optimiser(Flux.Optimise.ClipValue(1000),Flux.Optimise.Descent(lr))
 
 data = sample_kmers(6, batch_size)
 loader = Flux.Data.DataLoader(data, batchsize=batch_size,partial=false)
@@ -156,45 +156,27 @@ for epoch in 1:2000
         acc = accuracy(xbatch, ybatch)
         push!(losses, l)
         push!(accuracies, acc)
-        #if acc > 0.99
-        #    epoch = 100
-        #end
     end
     @show mean(losses), mean(accuracies)
 end
 
-function test_model()
-    test =  # We expect mostly B
-    test_batch = Flux.unstack(Flux.batch(map(seq -> float.(Flux.onehotbatch(seq,vocab)),test)),2)
-    pred = Flux.onecold(Flux.batch(model.(test_batch)),vocab)
-    return sum(pred .== ['C'])/batch_size
-end
-test_model()
-
-
-function predict(c)
-    x = [[c] for i in 1:batch_size]
-    x_batch = Flux.unstack(Flux.batch(map(seq -> float.(Flux.onehotbatch(seq,vocab)),x)),2)
-    # Sample random element
-    return Random.rand(Flux.onecold(Flux.batch(model.(x_batch)),vocab))
-end
-
-function predict_seq(c,n)
+function sample_seq(ch_init = "<", max_len=50)
+    x = Flux.onehotbatch(ch_init,vocab)
+    a_prev = zeros(nhidden)
     seq = []
-    for i in 1:n
-        c = predict(c)
-        push!(seq,c)
+    for i in 1:max_len
+        a = tanh.(model.cell.Wax*x + model.cell.Waa*a_prev .+ model.cell.ba)
+        z = model.cell.Wya * a .+ model.cell.by
+        y_pred = softmax(z)
+        ch = sample(vocab, Weights(y_pred[:]))
+        x = Flux.onehot(ch, vocab)
+        a_prev = a
+        if ch == '>'
+            break
+        end
+        push!(seq, ch)
     end
     return join(seq)
 end
 
-predict_seq('<',50) # "ABCDEFGHIJKLMNOPQRSTUVWXYZ>OPQRSTUVWXYZ>OPQRSTUVWX"
-predict_seq('<',50) # "CDEFGHIJKLMNOPQRSTUVWXYZ>OPQRSTUVWXYZ>OPQRSTUVWXYZ"
-predict_seq('<',50) # ">OPQRSTUVWXYZ>UVWXYZ>OPQRSTUVWXYZ>UVWXYZ>OPQRSTUVW"
-predict_seq('<',50) # "ABCDEFGHIJKLMNOPQRSTUVWXYZ>OPQRSTUVWXYZ>>VWXYZ>OPQ"
-predict_seq('<',50) # "ABCDEFGHIJKLMNOPQRSTUVWXYZ>OPQRSTUVWXYZ>OPQRSTUVWX"
-predict_seq('C',50) # "DEFGHIJKLMNOPQRSTUVWXYZ>OPQRSTUVWXYZ>OPQRSTUVWXYZ>"
-predict_seq('D',50) # "EFGHIJKLMNOPQRSTUVWXYZ>OPQRSTUVWXYZ>UVWXYZ>OPQRSTU"
-predict_seq('P',50) # "QRSTUVWXYZ>OPQRSTUVWXYZ>>VWXYZ>OPQRSTUVWXYZ>OPQRST"
-predict_seq('U',50) # "VWXYZ>STUVWXYZ>OPQRSTUVWXYZ>OPQRSTUVWXYZ>>VWXYZ>HI"
-
+sample_seq("<")
