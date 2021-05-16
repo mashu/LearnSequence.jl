@@ -116,7 +116,7 @@ end
 
 lr = 0.01
 batch_size = 100
-opt = Flux.Optimise.Optimiser(Flux.Optimise.ClipValue(1000),Flux.Optimise.Descent(lr))
+opt = Flux.Optimise.Optimiser(Flux.Optimise.ClipValue(1000),Flux.Optimise.ADAM(lr))
 
 data = sample_kmers(6, batch_size)
 loader = Flux.Data.DataLoader(data, batchsize=batch_size,partial=false)
@@ -125,8 +125,8 @@ nhidden = 32
 a_prev_tmp = randn(nhidden, batch_size)  # hidden x number of examples
 c_prev_tmp = randn(nhidden, batch_size)  # for LSTM variant we also need memory cells
 
-model = Flux.Recur(MyRNNCell(length(vocab), nhidden), a_prev_tmp)
-#model = Flux.Recur(MyLSTMCell(length(vocab), nhidden), (a_prev_tmp, c_prev_tmp))
+#model = Flux.Recur(MyRNNCell(length(vocab), nhidden), a_prev_tmp)
+model = Flux.Recur(MyLSTMCell(length(vocab), nhidden), (a_prev_tmp, c_prev_tmp))
 default_state = copy.(model.state)
 
 ps = params(model)
@@ -160,7 +160,10 @@ for epoch in 1:2000
     @show mean(losses), mean(accuracies)
 end
 
-function sample_seq(ch_init = "<", max_len=50)
+function sample_rnnseq(ch_init = "<", max_len=50)
+    """
+    For each time-step sample indices of vocab using probability distribution from softmax
+    """
     x = Flux.onehotbatch(ch_init,vocab)
     a_prev = zeros(nhidden)
     seq = []
@@ -179,4 +182,29 @@ function sample_seq(ch_init = "<", max_len=50)
     return join(seq)
 end
 
-sample_seq("<")
+function sample_lstmseq(ch_init = "<", max_len=50)
+    x = Flux.onehotbatch(ch_init,vocab)
+    a_prev = zeros(nhidden)
+    c_prev = zeros(nhidden)
+    seq = []
+    for i in 1:max_len
+        concat = vcat([a_prev,x]...)
+        Γf = σ.(model.cell.Wf*concat.+model.cell.bf)
+        c_next = tanh.(model.cell.Wc*concat.+model.cell.bc)
+        Γi = σ.(model.cell.Wi*concat.+model.cell.bi)
+        c = Γf.*c_prev+Γi.*c_next
+        Γo = σ.(model.cell.Wo*concat.+model.cell.bo)
+        a_next = Γo .* tanh.(c)
+        y_pred = softmax(model.cell.Wy*a_next.+model.cell.by)
+        ch = sample(vocab, Weights(y_pred[:]))
+        x = Flux.onehot(ch, vocab)
+        a_prev = a_next
+        if ch == '>'
+            break
+        end
+        push!(seq, ch)
+    end
+    return join(seq)
+end
+
+sample_lstmseq()
