@@ -6,6 +6,8 @@ using Zygote
 using Random
 using StatsBase
 Random.seed!(1234)
+using CUDA
+using BSON: @save
 
 # Define cell parameters
 struct MyRNNCell{tWax<:AbstractArray,tWaa<:AbstractArray,tWya<:AbstractArray,
@@ -38,11 +40,17 @@ Flux.@functor MyRNNCell
 # or directly marking fields which are trainable
 #Flux.trainable(m::MyRNNCell) = (m.Wax, m.Waa, m.Wya, m.ba, m.by)
 
+# Embedding layer to help model generalize
+struct EmbeddingLayer
+   W
+end
+EmbeddingLayer(mf, vs) = EmbeddingLayer(Flux.glorot_normal(mf, vs))
+Flux.@functor EmbeddingLayer
+(m::EmbeddingLayer)(x) = (m.W * x)
+
 #
 # Below define LSTM variant
 #
-
-# Define cell parameters
 struct MyLSTMCell
     Wf
     Wc
@@ -85,20 +93,6 @@ function (m::MyLSTMCell)(state, xt)
 end
 Flux.@functor MyLSTMCell
 
-# Simulate data
-vocab = [c for c in "<ABCDEFGHIJKLMNOPQRSTUVWXYZ>"]
-function kmers(k=5)
-    return [vocab[i:(i+k)-1] for i in 1:length(vocab)-k+1]
-end
-
-function sample_kmers(k=6, m=100)
-    examples = []
-    for i in 1:m
-        push!(examples,Random.shuffle(kmers(k)))
-    end
-    return vcat(examples...)
-end
-
 function shift(seq)
     return seq[1:end-1], seq[2:end]
 end
@@ -108,31 +102,71 @@ function shift_batch(example)
     return first.(vec), last.(vec)
 end
 
-function accuracy(x,y)
-    ŷ = Flux.onecold(Flux.batch(model.(x)),vocab)
-    y  = Flux.onecold(Flux.batch(y),vocab)
-    return sum(ŷ .== y)/length(y)
+# Add more challanging dataset
+function load_names(path="dinos.txt")
+    lines = []
+    unique = Set(['-'])
+    open(path,"r") do f
+        for line in eachline(f)
+            line = '<'*line*'>'
+            push!(lines,line)
+            for c in line
+                push!(unique,c)
+            end
+        end
+    end
+
+    # Pad the lines to maximum length
+    data = rpad.(lines,maximum(length.(lines)),'-')
+    vocab = collect(unique)
+    # Return
+    return data, vocab
 end
 
 lr = 0.01
-batch_size = 100
-opt = Flux.Optimise.Optimiser(Flux.Optimise.ClipValue(1000),Flux.Optimise.ADAM(lr))
+batch_size = 10
+# opt = Flux.Optimise.Optimiser(Flux.Optimise.ClipValue(1000),Flux.Optimise.ADAM(lr))
+opt = Flux.Optimise.ADAM(lr)
 
-data = sample_kmers(6, batch_size)
-loader = Flux.Data.DataLoader(data, batchsize=batch_size,partial=false)
+data, vocab = load_names()
+loader = Flux.Data.DataLoader(data, batchsize=batch_size, partial=false)
+nhidden = 64
 
-nhidden = 32
 a_prev_tmp = randn(nhidden, batch_size)  # hidden x number of examples
 c_prev_tmp = randn(nhidden, batch_size)  # for LSTM variant we also need memory cells
 
-#model = Flux.Recur(MyRNNCell(length(vocab), nhidden), a_prev_tmp)
-model = Flux.Recur(MyLSTMCell(length(vocab), nhidden), (a_prev_tmp, c_prev_tmp))
+# model = Flux.Recur(MyRNNCell(length(vocab), nhidden), a_prev_tmp)
+embedding = EmbeddingLayer(length(vocab),length(vocab))
+model = Flux.Recur(MyLSTMCell(length(vocab), nhidden), (a_prev_tmp, c_prev_tmp)) #|> gpu
 default_state = copy.(model.state)
 
 ps = params(model)
 
 function loss(x,y)
-    l = sum(Flux.Losses.crossentropy.(model.(x),y))
+    yhat = model.(embedding.(x))
+    l = sum(Flux.Losses.crossentropy.(yhat,y,agg=sum))
+    return l
+end
+
+function accuracy(x,y; ignore='-')
+    default_state = copy.(model.state)
+    ŷ = Flux.onecold(Flux.batch(model.(embedding.(x))),vocab)
+    y  = Flux.onecold(Flux.batch(y),vocab)
+    match = (ŷ .== y) .| (y .== '-')
+    return sum(match)/length(y)
+end
+
+function wloss(x,y,w)
+    """
+    Weighted loss which can be used to exclude padded elements
+    """
+    yhat = model.(x)
+    l = 0
+    for i in 1:length(x)
+        if length(y[i][:,w[i]]) != 0
+            l+= Flux.Losses.crossentropy(yhat[i][:,w[i]],y[i][:,w[i]], agg=sum)
+        end
+    end
     return l
 end
 
@@ -142,13 +176,18 @@ for epoch in 1:2000
     for example in loader
         xexample, yexample = shift_batch(example)
 
-        xbatch = Flux.unstack(Flux.batch(map(seq -> float.(Flux.onehotbatch(seq,vocab)),xexample)),2)
-        ybatch = Flux.unstack(Flux.batch(map(seq -> float.(Flux.onehotbatch(seq,vocab)),yexample)),2)
+        # Get weights and into correct dimenions
+        # weights = map(s -> [c != '-' for c in s], Flux.batchseq(yexample,' '))
+
         model.state = copy.(default_state)
+
+        xbatch = Flux.unstack(Flux.batch(map(seq -> float.(Flux.onehotbatch(seq,vocab)),xexample)),2) #|> gpu
+        ybatch = Flux.unstack(Flux.batch(map(seq -> float.(Flux.onehotbatch(seq,vocab)),yexample)),2) #|> gpu
 
         l = 0
         gs = Zygote.gradient(ps) do
             # Foreach timepoint compute enitre batch of activations
+            # l = wloss(xbatch, ybatch, weights)
             l = loss(xbatch, ybatch)
             return l
         end
@@ -158,7 +197,10 @@ for epoch in 1:2000
         push!(accuracies, acc)
     end
     @show mean(losses), mean(accuracies)
+    #break
 end
+
+# @save "embedding-acc72.bson" embedding
 
 function sample_rnnseq(ch_init = "<", max_len=50)
     """
@@ -183,7 +225,7 @@ function sample_rnnseq(ch_init = "<", max_len=50)
 end
 
 function sample_lstmseq(ch_init = "<", max_len=50)
-    x = Flux.onehotbatch(ch_init,vocab)
+    x = Flux.squeezebatch(embedding(Flux.onehotbatch(ch_init,vocab)))
     a_prev = zeros(nhidden)
     c_prev = zeros(nhidden)
     seq = []
@@ -206,5 +248,4 @@ function sample_lstmseq(ch_init = "<", max_len=50)
     end
     return join(seq)
 end
-
-sample_lstmseq()
+sample_lstmseq("<")
