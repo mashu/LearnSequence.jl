@@ -6,26 +6,25 @@ using Zygote
 using Random
 using StatsBase
 Random.seed!(1234)
-using CUDA
-using BSON: @save
+#using CUDA
+using BSON: @save, @load
 
 # Define cell parameters
-struct MyRNNCell{tWax<:AbstractArray,tWaa<:AbstractArray,tWya<:AbstractArray,
-                 tba<:AbstractVector,tby<:AbstractVector}
-    Wax::tWax
-    Waa::tWaa
-    Wya::tWya
-    ba::tba
-    by::tby
+struct MyRNNCell
+    Wax
+    Waa
+    Wya
+    ba
+    by
 end
 
 # Constructor with random initialization
 MyRNNCell(nx::Integer, na::Integer) = MyRNNCell(
-    randn(na, nx), # Wax
-    randn(na, na), # Waa
-    randn(nx, na), # Wya
-    randn(na),  # ba
-    randn(nx)  # by
+    Flux.glorot_normal(na, nx), # Wax
+    Flux.glorot_normal(na, na), # Waa
+    Flux.glorot_normal(nx, na), # Wya
+    Flux.glorot_normal(na),  # ba
+    Flux.glorot_normal(nx)  # by
     )
 
 # Implement forward pass
@@ -66,16 +65,16 @@ end
 
 # Constructor with random initialization
 MyLSTMCell(nx::Integer, na::Integer) = MyLSTMCell(
-    randn(na, na+nx),
-    randn(na, na+nx),
-    randn(na, na+nx),
-    randn(na, na+nx),
-    randn(nx, na),
-    randn(na),
-    randn(na),
-    randn(na),
-    randn(na),
-    randn(nx)
+    Flux.glorot_normal(na, na+nx),
+    Flux.glorot_normal(na, na+nx),
+    Flux.glorot_normal(na, na+nx),
+    Flux.glorot_normal(na, na+nx),
+    Flux.glorot_normal(nx, na),
+    Flux.glorot_normal(na),
+    Flux.glorot_normal(na),
+    Flux.glorot_normal(na),
+    Flux.glorot_normal(na),
+    Flux.glorot_normal(nx)
     )
 
 # Implement forward pass
@@ -105,7 +104,7 @@ end
 # Add more challanging dataset
 function load_names(path="dinos.txt")
     lines = []
-    unique = Set(['-'])
+    unique = Set([' '])
     open(path,"r") do f
         for line in eachline(f)
             line = '<'*line*'>'
@@ -117,14 +116,15 @@ function load_names(path="dinos.txt")
     end
 
     # Pad the lines to maximum length
-    data = rpad.(lines,maximum(length.(lines)),'-')
+    data = rpad.(lines,maximum(length.(lines)),' ')
+    #data = lines
     vocab = collect(unique)
     # Return
     return data, vocab
 end
 
 lr = 0.01
-batch_size = 10
+batch_size = 100
 # opt = Flux.Optimise.Optimiser(Flux.Optimise.ClipValue(1000),Flux.Optimise.ADAM(lr))
 opt = Flux.Optimise.ADAM(lr)
 
@@ -132,27 +132,29 @@ data, vocab = load_names()
 loader = Flux.Data.DataLoader(data, batchsize=batch_size, partial=false)
 nhidden = 64
 
-a_prev_tmp = randn(nhidden, batch_size)  # hidden x number of examples
-c_prev_tmp = randn(nhidden, batch_size)  # for LSTM variant we also need memory cells
+a_prev_tmp = zeros(nhidden, batch_size)  # hidden x number of examples
+c_prev_tmp = zeros(nhidden, batch_size)  # for LSTM variant we also need memory cells
 
-# model = Flux.Recur(MyRNNCell(length(vocab), nhidden), a_prev_tmp)
+model = Flux.Recur(MyRNNCell(length(vocab), nhidden), a_prev_tmp)
 embedding = EmbeddingLayer(length(vocab),length(vocab))
-model = Flux.Recur(MyLSTMCell(length(vocab), nhidden), (a_prev_tmp, c_prev_tmp)) #|> gpu
+#model = Flux.Recur(MyLSTMCell(length(vocab), nhidden), (a_prev_tmp, c_prev_tmp)) #|> gpu
 default_state = copy.(model.state)
 
 ps = params(model)
 
 function loss(x,y)
-    yhat = model.(embedding.(x))
+    #yhat = model.(embedding.(x))
+    yhat = model.(x)
     l = sum(Flux.Losses.crossentropy.(yhat,y,agg=sum))
     return l
 end
 
-function accuracy(x,y; ignore='-')
+function accuracy(x,y; ignore=' ')
     default_state = copy.(model.state)
-    ŷ = Flux.onecold(Flux.batch(model.(embedding.(x))),vocab)
+    #ŷ = Flux.onecold(Flux.batch(model.(embedding.(x))),vocab)
+    ŷ = Flux.onecold(Flux.batch(model.(x)),vocab)
     y  = Flux.onecold(Flux.batch(y),vocab)
-    match = (ŷ .== y) .| (y .== '-')
+    match = (ŷ .== y) .| (y .== ignore)
     return sum(match)/length(y)
 end
 
@@ -177,7 +179,7 @@ for epoch in 1:2000
         xexample, yexample = shift_batch(example)
 
         # Get weights and into correct dimenions
-        # weights = map(s -> [c != '-' for c in s], Flux.batchseq(yexample,' '))
+        #weights = map(s -> [c != '-' for c in s], Flux.batchseq(yexample,' '))
 
         model.state = copy.(default_state)
 
@@ -187,7 +189,7 @@ for epoch in 1:2000
         l = 0
         gs = Zygote.gradient(ps) do
             # Foreach timepoint compute enitre batch of activations
-            # l = wloss(xbatch, ybatch, weights)
+            #l = wloss(xbatch, ybatch, weights)
             l = loss(xbatch, ybatch)
             return l
         end
@@ -199,7 +201,6 @@ for epoch in 1:2000
     @show mean(losses), mean(accuracies)
     #break
 end
-
 # @save "embedding-acc72.bson" embedding
 
 function sample_rnnseq(ch_init = "<", max_len=50)
@@ -224,8 +225,11 @@ function sample_rnnseq(ch_init = "<", max_len=50)
     return join(seq)
 end
 
+sample_rnnseq("S")
+
 function sample_lstmseq(ch_init = "<", max_len=50)
-    x = Flux.squeezebatch(embedding(Flux.onehotbatch(ch_init,vocab)))
+    #x = Flux.squeezebatch(embedding(Flux.onehotbatch(ch_init,vocab)))
+    x = Flux.onehotbatch(ch_init,vocab)
     a_prev = zeros(nhidden)
     c_prev = zeros(nhidden)
     seq = []
