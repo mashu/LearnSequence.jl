@@ -6,7 +6,7 @@ using Zygote
 using Random
 using StatsBase
 Random.seed!(1234)
-#using CUDA
+using CUDA
 using BSON: @save, @load
 
 # Define cell parameters
@@ -45,7 +45,7 @@ struct EmbeddingLayer
 end
 EmbeddingLayer(mf, vs) = EmbeddingLayer(Flux.glorot_normal(mf, vs))
 Flux.@functor EmbeddingLayer
-(m::EmbeddingLayer)(x) = (m.W * x)
+(m::EmbeddingLayer)(x) = (m.W' * x)
 
 #
 # Below define LSTM variant
@@ -125,8 +125,8 @@ end
 
 lr = 0.01
 batch_size = 100
-# opt = Flux.Optimise.Optimiser(Flux.Optimise.ClipValue(1000),Flux.Optimise.ADAM(lr))
 opt = Flux.Optimise.ADAM(lr)
+#opt = Flux.Optimiser(Flux.Optimise.ClipValue(1e-3), Flux.Optimise.ADAM(1e-3))
 
 data, vocab = load_names()
 loader = Flux.Data.DataLoader(data, batchsize=batch_size, partial=false)
@@ -135,14 +135,15 @@ nhidden = 64
 a_prev_tmp = zeros(nhidden, batch_size)  # hidden x number of examples
 c_prev_tmp = zeros(nhidden, batch_size)  # for LSTM variant we also need memory cells
 
-model = Flux.Recur(MyRNNCell(length(vocab), nhidden), a_prev_tmp)
+#model = Flux.Recur(MyRNNCell(length(vocab), nhidden), a_prev_tmp)
 embedding = EmbeddingLayer(length(vocab),length(vocab))
-#model = Flux.Recur(MyLSTMCell(length(vocab), nhidden), (a_prev_tmp, c_prev_tmp)) #|> gpu
+model = Flux.Recur(MyLSTMCell(length(vocab), nhidden), (a_prev_tmp, c_prev_tmp)) #|> gpu
 default_state = copy.(model.state)
 
 ps = params(model)
 
 function loss(x,y)
+    model.state = copy.(default_state)
     #yhat = model.(embedding.(x))
     yhat = model.(x)
     l = sum(Flux.Losses.crossentropy.(yhat,y,agg=sum))
@@ -150,10 +151,10 @@ function loss(x,y)
 end
 
 function accuracy(x,y; ignore=' ')
-    default_state = copy.(model.state)
+    model.state = copy.(default_state)
     #ŷ = Flux.onecold(Flux.batch(model.(embedding.(x))),vocab)
     ŷ = Flux.onecold(Flux.batch(model.(x)),vocab)
-    y  = Flux.onecold(Flux.batch(y),vocab)
+    y = Flux.onecold(Flux.batch(y),vocab)
     match = (ŷ .== y) .| (y .== ignore)
     return sum(match)/length(y)
 end
@@ -162,6 +163,7 @@ function wloss(x,y,w)
     """
     Weighted loss which can be used to exclude padded elements
     """
+    model.state = copy.(default_state)
     yhat = model.(x)
     l = 0
     for i in 1:length(x)
@@ -201,13 +203,14 @@ for epoch in 1:2000
     @show mean(losses), mean(accuracies)
     #break
 end
-# @save "embedding-acc72.bson" embedding
+#@save "dino-rnn-acc83.bson" model
 
 function sample_rnnseq(ch_init = "<", max_len=50)
     """
     For each time-step sample indices of vocab using probability distribution from softmax
     """
     x = Flux.onehotbatch(ch_init,vocab)
+    #x = Flux.squeezebatch(embedding(Flux.onehotbatch(ch_init,vocab)))
     a_prev = zeros(nhidden)
     seq = []
     for i in 1:max_len
@@ -225,7 +228,7 @@ function sample_rnnseq(ch_init = "<", max_len=50)
     return join(seq)
 end
 
-sample_rnnseq("S")
+sample_rnnseq()
 
 function sample_lstmseq(ch_init = "<", max_len=50)
     #x = Flux.squeezebatch(embedding(Flux.onehotbatch(ch_init,vocab)))
@@ -252,4 +255,6 @@ function sample_lstmseq(ch_init = "<", max_len=50)
     end
     return join(seq)
 end
-sample_lstmseq("<")
+for i in 1:10
+    println(sample_rnnseq("<"))
+end
