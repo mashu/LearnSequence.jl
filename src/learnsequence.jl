@@ -9,6 +9,9 @@ Random.seed!(1234)
 using CUDA
 using BSON: @save, @load
 
+# Do not allow scalar operations on GPU, since those are slow
+CUDA.allowscalar(false)
+
 # Define cell parameters
 struct MyRNNCell
     Wax
@@ -45,7 +48,7 @@ struct EmbeddingLayer
 end
 EmbeddingLayer(mf, vs) = EmbeddingLayer(Flux.glorot_normal(mf, vs))
 Flux.@functor EmbeddingLayer
-(m::EmbeddingLayer)(x) = (m.W' * x)
+(m::EmbeddingLayer)(x) = (m.W * x)
 
 #
 # Below define LSTM variant
@@ -117,7 +120,6 @@ function load_names(path="dinos.txt")
 
     # Pad the lines to maximum length
     data = rpad.(lines,maximum(length.(lines)),' ')
-    #data = lines
     vocab = collect(unique)
     # Return
     return data, vocab
@@ -129,17 +131,18 @@ opt = Flux.Optimise.ADAM(lr)
 #opt = Flux.Optimiser(Flux.Optimise.ClipValue(1e-3), Flux.Optimise.ADAM(1e-3))
 
 data, vocab = load_names()
-loader = Flux.Data.DataLoader(data, batchsize=batch_size, partial=false)
+loader = Flux.Data.DataLoader(data, batchsize=batch_size, partial=false,shuffle=true)
 nhidden = 64
 
 a_prev_tmp = zeros(nhidden, batch_size)  # hidden x number of examples
 c_prev_tmp = zeros(nhidden, batch_size)  # for LSTM variant we also need memory cells
 
-#model = Flux.Recur(MyRNNCell(length(vocab), nhidden), a_prev_tmp)
-embedding = EmbeddingLayer(length(vocab),length(vocab))
-model = Flux.Recur(MyLSTMCell(length(vocab), nhidden), (a_prev_tmp, c_prev_tmp)) #|> gpu
+model = Flux.Recur(MyRNNCell(length(vocab), nhidden), a_prev_tmp) |> gpu
+embedding = EmbeddingLayer(length(vocab),length(vocab)) |> gpu
+#model = Flux.Recur(MyLSTMCell(length(vocab), nhidden), (a_prev_tmp, c_prev_tmp)) #|> gpu
 default_state = copy.(model.state)
 
+#ps = params(model, embedding)
 ps = params(model)
 
 function loss(x,y)
@@ -181,12 +184,12 @@ for epoch in 1:2000
         xexample, yexample = shift_batch(example)
 
         # Get weights and into correct dimenions
-        #weights = map(s -> [c != '-' for c in s], Flux.batchseq(yexample,' '))
+        weights = map(s -> [c != ' ' for c in s], Flux.batchseq(yexample,' ')) |> gpu
 
         model.state = copy.(default_state)
 
-        xbatch = Flux.unstack(Flux.batch(map(seq -> float.(Flux.onehotbatch(seq,vocab)),xexample)),2) #|> gpu
-        ybatch = Flux.unstack(Flux.batch(map(seq -> float.(Flux.onehotbatch(seq,vocab)),yexample)),2) #|> gpu
+        xbatch = Flux.unstack(Flux.batch(map(seq -> float.(Flux.onehotbatch(seq,vocab)),xexample)),2) |> gpu
+        ybatch = Flux.unstack(Flux.batch(map(seq -> float.(Flux.onehotbatch(seq,vocab)),yexample)),2) |> gpu
 
         l = 0
         gs = Zygote.gradient(ps) do
@@ -201,7 +204,7 @@ for epoch in 1:2000
         push!(accuracies, acc)
     end
     @show mean(losses), mean(accuracies)
-    #break
+    # break
 end
 #@save "dino-rnn-acc83.bson" model
 
@@ -209,13 +212,14 @@ function sample_rnnseq(ch_init = "<", max_len=50)
     """
     For each time-step sample indices of vocab using probability distribution from softmax
     """
-    x = Flux.onehotbatch(ch_init,vocab)
-    #x = Flux.squeezebatch(embedding(Flux.onehotbatch(ch_init,vocab)))
+    #x = Flux.onehotbatch(ch_init,vocab)
+    x = Flux.squeezebatch(embedding(Flux.onehotbatch(ch_init,vocab))) |> cpu
     a_prev = zeros(nhidden)
     seq = []
+    m = model |> cpu
     for i in 1:max_len
-        a = tanh.(model.cell.Wax*x + model.cell.Waa*a_prev .+ model.cell.ba)
-        z = model.cell.Wya * a .+ model.cell.by
+        a = tanh.(m.cell.Wax*x + m.cell.Waa*a_prev .+ m.cell.ba)
+        z = m.cell.Wya * a .+ m.cell.by
         y_pred = softmax(z)
         ch = sample(vocab, Weights(y_pred[:]))
         x = Flux.onehot(ch, vocab)
@@ -229,6 +233,10 @@ function sample_rnnseq(ch_init = "<", max_len=50)
 end
 
 sample_rnnseq()
+
+for i in 1:50
+    println(sample_rnnseq())
+end
 
 function sample_lstmseq(ch_init = "<", max_len=50)
     #x = Flux.squeezebatch(embedding(Flux.onehotbatch(ch_init,vocab)))
@@ -256,5 +264,5 @@ function sample_lstmseq(ch_init = "<", max_len=50)
     return join(seq)
 end
 for i in 1:10
-    println(sample_rnnseq("<"))
+    println("S"*sample_lstmseq("S"))
 end
